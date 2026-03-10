@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="es" class="light">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Puter RSS Pro</title>
+  <script src="https://js.puter.com/v2/"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { darkMode: "class" };
+  </script>
+</head>
+
+<body class="bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 min-h-screen">
+  <button onclick="toggleSidebar()" class="md:hidden p-4 fixed top-0 left-0 z-5 text-2xl">
+    ☰
+  </button>
+
+  <div class="flex h-screen overflow-hidden">
+    <aside id="sidebar"
+      class="fixed md:relative inset-y-0 left-0 transform -translate-x-full md:translate-x-0 transition-transform duration-300 z-40 w-80 border-r border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 p-4 flex flex-col shadow-xl md:shadow-none">
+      <div class="flex items-center gap-3 mb-6 md:mt-0">
+        <div class="text-2xl">📡</div>
+        <h1 class="text-xl font-bold">Puter RSS</h1>
+      </div>
+
+      <div id="user-panel"
+        class="mb-4 p-3 rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900">
+        <p id="user-status" class="text-xs text-slate-500 mb-2">
+          No has iniciado sesion
+        </p>
+        <div class="flex gap-2">
+          <button id="sign-in-btn" onclick="signInUser()"
+            class="flex-1 bg-blue-600 hover:bg-blue-700 text-white py-1.5 rounded-md text-xs font-medium">
+            Iniciar sesion
+          </button>
+          <button id="sign-out-btn" onclick="signOutUser()"
+            class="hidden flex-1 bg-slate-200 dark:bg-slate-700 py-1.5 rounded-md text-xs font-medium">
+            Cerrar sesion
+          </button>
+        </div>
+      </div>
+
+      <div class="space-y-2 mb-6">
+        <button onclick="openModal('cat')"
+          class="w-full bg-slate-600 hover:bg-slate-700 text-white py-2 rounded-md font-medium">
+          + Categoría
+        </button>
+        <button onclick="openModal('feed')" class="w-full bg-slate-200 dark:bg-slate-700 py-2 rounded-md font-medium">
+          + Añadir Feed
+        </button>
+      </div>
+
+      <h3 class="text-xs font-bold text-slate-400 uppercase mb-2 px-2">
+        Categorías
+      </h3>
+      <nav class="flex-1 overflow-y-auto space-y-1" id="category-list"></nav>
+
+      <h3 class="text-xs font-bold text-slate-400 uppercase mt-6 mb-2 px-2">
+        Gestionar Mis Fuentes
+      </h3>
+      <button onclick="openManageFeedsModal()"
+        class="w-full bg-slate-200 dark:bg-slate-700 py-2 rounded-md font-medium text-sm">
+        Abrir Gestor de Fuentes
+      </button>
+
+      <div class="pt-4 mt-4 border-t border-slate-200 dark:border-slate-700">
+        <button id="theme-toggle-btn" onclick="toggleDarkMode()"
+          class="w-full p-2 rounded-md hover:bg-slate-200 dark:hover:bg-slate-700 text-sm">
+          <span id="theme-toggle-icon">🌓</span>
+          <span id="theme-toggle-label">Cambiar Modo</span>
+        </button>
+      </div>
+    </aside>
+
+    <div id="overlay" onclick="toggleSidebar()" class="hidden md:hidden fixed inset-0 bg-black/50 z-30"></div>
+
+    <main class="flex-1 flex flex-col bg-white dark:bg-slate-900 overflow-hidden">
+      <header
+        class="h-16 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between px-6 pl-16 md:pl-6 gap-4">
+        <h2 id="current-view-title" class="font-bold">Noticias Recientes</h2>
+
+        <div class="flex items-center gap-3">
+          <button onclick="openAiChatModal()"
+            class="px-3 py-1 rounded-md bg-slate-200 dark:bg-slate-700 text-xs font-bold">Chat IA</button>
+
+          <input id="searchInput" type="text" placeholder="Buscar..."
+            class="px-3 py-1 rounded-md bg-slate-100 dark:bg-slate-700 text-sm" oninput="applyFilters()" />
+
+          <select id="sortSelect" class="px-2 py-1 rounded-md bg-slate-100 dark:bg-slate-700 text-sm"
+            onchange="applyFilters()">
+            <option value="desc">Más recientes</option>
+            <option value="asc">Más antiguos</option>
+            <option value="az">A → Z</option>
+            <option value="za">Z → A</option>
+          </select>
+
+          <div id="loader"
+            class="hidden animate-spin h-5 w-5 border-2 border-blue-500 border-t-transparent rounded-full"></div>
+        </div>
+      </header>
+      <div id="feed-container" class="flex-1 overflow-y-auto p-6 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+      </div>
+      <div id="pagination" class="flex justify-center gap-2 mt-6 pb-6"></div>
+      <footer class="px-6 pb-4 text-[11px] text-slate-500 dark:text-slate-400 text-center">
+        <a href="https://developer.puter.com" target="_blank" rel="noopener noreferrer" class="underline">Powered by
+          Puter</a>
+      </footer>
+    </main>
+  </div>
+
+  <div id="modal"
+    class="hidden fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+    <div class="bg-white dark:bg-slate-800 p-6 rounded-md w-full max-w-md shadow-2xl">
+      <h3 id="modal-title" class="text-xl font-bold mb-4">Configuración</h3>
+      <div id="modal-content" class="space-y-4"></div>
+      <div class="flex justify-end gap-3 mt-8">
+        <button onclick="closeModal()"
+          class="px-4 py-2 text-slate-50 bg-red-400 hover:bg-red-300 transition rounded-md font-medium">
+          Cancelar
+        </button>
+        <button id="modal-save"
+          class="px-6 py-2 bg-slate-600 hover:bg-slate-700 text-white rounded-md font-bold transition">
+          Guardar
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div id="manage-feeds-modal"
+    class="hidden fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+    <div class="bg-white dark:bg-slate-800 p-6 rounded-md w-full max-w-2xl shadow-2xl">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="text-xl font-bold">Gestionar Mis Fuentes</h3>
+        <button onclick="closeManageFeedsModal()" class="text-slate-500 hover:text-slate-900 dark:hover:text-white">
+          ✕
+        </button>
+      </div>
+
+      <div class="flex gap-2 mb-4">
+        <button onclick="triggerConfigImport()"
+          class="px-4 py-2 bg-slate-200 dark:bg-slate-700 rounded-md text-sm font-medium">
+          Importar JSON
+        </button>
+        <button onclick="createJsonBackup()"
+          class="px-4 py-2 bg-slate-600 hover:bg-slate-700 text-white rounded-md text-sm font-medium">
+          Crear Backup JSON
+        </button>
+        <input id="config-import-input" type="file" accept="application/json,.json" class="hidden"
+          onchange="handleConfigImport(event)" />
+      </div>
+
+      <div
+        class="h-80 overflow-y-auto border border-slate-200 dark:border-slate-700 rounded-md p-2 bg-white dark:bg-slate-900"
+        id="manage-feeds-list"></div>
+    </div>
+  </div>
+
+  <script src="main.js"></script>
+
+  <div id="ai-summary-modal"
+    class="hidden fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+    <div class="bg-white dark:bg-slate-800 p-6 rounded-md w-full max-w-xl shadow-2xl">
+      <div class="flex justify-between items-center gap-3 mb-4">
+        <h3 class="text-lg font-bold">Resumen IA</h3>
+        <button onclick="closeSummaryModal()" class="text-slate-500 hover:text-slate-900 dark:hover:text-white">
+          ✕
+        </button>
+      </div>
+      <div id="ai-summary-loader" class="hidden flex items-center gap-2 mb-3">
+        <div class="animate-spin h-4 w-4 border-2 border-blue-500 border-t-transparent rounded-full"></div>
+        <span class="text-xs text-slate-500 dark:text-slate-300">Generando resumen...</span>
+      </div>
+      <div id="ai-summary-content"
+        class="text-sm text-slate-700 dark:text-slate-200 whitespace-pre-wrap leading-relaxed"></div>
+    </div>
+  </div>
+
+  <div id="ai-chat-modal"
+    class="hidden fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+    <div class="bg-white dark:bg-slate-800 p-4 rounded-md w-full max-w-2xl shadow-2xl">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-bold">Asistente IA</h3>
+        <div class="flex items-center gap-2">
+          <button onclick="clearAiChat()"
+            class="px-2 py-1 text-xs rounded-md bg-slate-200 dark:bg-slate-700">Borrar chat</button>
+          <button onclick="closeAiChatModal()" class="text-slate-500 hover:text-slate-900 dark:hover:text-white">✕</button>
+        </div>
+      </div>
+
+      <label class="flex items-center gap-2 mb-3 text-xs text-slate-600 dark:text-slate-300">
+        <input id="ai-chat-safe-mode" type="checkbox" checked onchange="toggleAiChatSafeMode(this.checked)" />
+        Modo seguro (pedir confirmación antes de ejecutar acciones)
+      </label>
+
+      <div id="ai-chat-messages"
+        class="h-80 overflow-y-auto border border-slate-200 dark:border-slate-700 rounded-md p-3 bg-slate-50 dark:bg-slate-900 space-y-2"></div>
+
+      <div class="mt-3 flex gap-2">
+        <input id="ai-chat-input" type="text"
+          placeholder="Ejemplo: añade la categoria Tecnologia y el feed https://example.com/rss"
+          class="flex-1 px-3 py-2 rounded-md bg-slate-100 dark:bg-slate-700 text-sm"
+          onkeydown="if(event.key==='Enter'){sendAiChatMessage()}" />
+        <button id="ai-chat-send-btn" onclick="sendAiChatMessage()"
+          class="px-4 py-2 bg-slate-600 hover:bg-slate-700 text-white rounded-md text-sm font-bold">Enviar</button>
+      </div>
+    </div>
+  </div>
+</body>
+
+</html>
