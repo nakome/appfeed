@@ -22,11 +22,19 @@ class AppFeed {
         this.currentPage = 1;
         this.itemsPerPage = 9;
 
+        this.currentFilterCatId = null;
+        this.autoRefreshMs = 5 * 60 * 1000;
+        this.autoRefreshEnabled = true;
+        this.autoRefreshTimer = null;
+        this.isRefreshingFeeds = false;
+
         this.db = {
             categories: [],
             feeds: [],
             settings: {
                 darkMode: true,
+                autoRefreshMs: 5 * 60 * 1000,
+                autoRefreshEnabled: true,
             },
         };
 
@@ -59,11 +67,97 @@ class AppFeed {
 
             this.applyThemePreference();
             this.renderUI();
+            this.autoRefreshMs = this.db.settings.autoRefreshMs;
+            this.autoRefreshEnabled = this.db.settings.autoRefreshEnabled;
+            this.updateRefreshIntervalControl();
+            this.updateAutoRefreshToggleControl();
             await this.refreshUserInfo();
             await this.loadAllFeeds();
+            this.setupAutoRefresh();
         } catch (e) {
             console.error("Init error:", e);
         }
+    }
+
+    setupAutoRefresh() {
+        this.startAutoRefresh();
+
+        document.addEventListener("visibilitychange", () => {
+            if (document.hidden) {
+                this.stopAutoRefresh();
+                return;
+            }
+
+            this.startAutoRefresh();
+            this.refreshFeedsSilently();
+        });
+
+        window.addEventListener("beforeunload", () => this.stopAutoRefresh());
+    }
+
+    startAutoRefresh() {
+        this.stopAutoRefresh();
+        if (!this.autoRefreshEnabled) return;
+        this.autoRefreshTimer = window.setInterval(() => {
+            this.refreshFeedsSilently();
+        }, this.autoRefreshMs);
+    }
+
+    stopAutoRefresh() {
+        if (!this.autoRefreshTimer) return;
+        clearInterval(this.autoRefreshTimer);
+        this.autoRefreshTimer = null;
+    }
+
+    async refreshFeedsSilently() {
+        if (this.isRefreshingFeeds) return;
+        await this.loadAllFeeds(this.currentFilterCatId, { preservePage: true, closeSidebarOnMobile: false });
+    }
+
+    updateRefreshIntervalControl() {
+        const select = document.getElementById("refreshIntervalSelect");
+        if (!select) return;
+
+        const value = String(this.autoRefreshMs);
+        const hasOption = Array.from(select.options).some((opt) => opt.value === value);
+        if (hasOption) {
+            select.value = value;
+        }
+    }
+
+    updateAutoRefreshToggleControl() {
+        const toggle = document.getElementById("auto-refresh-toggle");
+        const label = document.getElementById("auto-refresh-toggle-label");
+
+        if (toggle) toggle.checked = this.autoRefreshEnabled;
+        if (label) label.textContent = this.autoRefreshEnabled ? "Auto ON" : "Auto OFF";
+    }
+
+    async setRefreshInterval(valueMs) {
+        const next = Number(valueMs);
+        if (!Number.isFinite(next) || next < 30000) return;
+        if (next === this.autoRefreshMs) return;
+
+        this.autoRefreshMs = next;
+        this.db.settings.autoRefreshMs = next;
+        this.updateRefreshIntervalControl();
+        this.startAutoRefresh();
+        await this.saveToPuter();
+    }
+
+    async setAutoRefreshEnabled(enabled) {
+        this.autoRefreshEnabled = Boolean(enabled);
+        this.db.settings.autoRefreshEnabled = this.autoRefreshEnabled;
+        this.updateAutoRefreshToggleControl();
+
+        if (this.autoRefreshEnabled) {
+            this.startAutoRefresh();
+            await this.refreshFeedsSilently();
+        } else {
+            this.stopAutoRefresh();
+        }
+
+        await this.saveToPuter();
     }
 
     // Guarda estado persistente.
@@ -81,6 +175,12 @@ class AppFeed {
         }
         if (typeof this.db.settings.darkMode !== "boolean") {
             this.db.settings.darkMode = true;
+        }
+        if (!Number.isFinite(this.db.settings.autoRefreshMs) || this.db.settings.autoRefreshMs < 30000) {
+            this.db.settings.autoRefreshMs = 5 * 60 * 1000;
+        }
+        if (typeof this.db.settings.autoRefreshEnabled !== "boolean") {
+            this.db.settings.autoRefreshEnabled = true;
         }
     }
 
@@ -249,10 +349,15 @@ class AppFeed {
         return Number.isNaN(time) ? 0 : time;
     }
 
-    async loadAllFeeds(filterCatId = null) {
+    async loadAllFeeds(filterCatId = null, options = {}) {
+        const { preservePage = false, closeSidebarOnMobile = true } = options;
+        if (this.isRefreshingFeeds) return;
+
+        this.isRefreshingFeeds = true;
+        this.currentFilterCatId = filterCatId;
         this.allItems = [];
         this.failedFeeds = [];
-        this.currentPage = 1;
+        if (!preservePage) this.currentPage = 1;
 
         const container = document.getElementById("feed-container");
         document.getElementById("loader").classList.remove("hidden");
@@ -262,24 +367,28 @@ class AppFeed {
             ? this.db.feeds.filter((f) => f.catId === filterCatId)
             : this.db.feeds;
 
-        const feedResults = await Promise.all(
-            feeds.map(async (feed) => ({ feed, res: await this.fetchRSS(feed.url) })),
-        );
+        try {
+            const feedResults = await Promise.all(
+                feeds.map(async (feed) => ({ feed, res: await this.fetchRSS(feed.url) })),
+            );
 
-        feedResults.forEach(({ feed, res }) => {
-            if (res.error) {
-                this.failedFeeds.push({ url: feed.url, error: res.error });
-                return;
-            }
-            this.allItems.push(...res.items);
-        });
+            feedResults.forEach(({ feed, res }) => {
+                if (res.error) {
+                    this.failedFeeds.push({ url: feed.url, error: res.error });
+                    return;
+                }
+                this.allItems.push(...res.items);
+            });
 
-        // Mezcla noticias de todos los feeds por fecha/hora, no por origen.
-        this.allItems.sort((a, b) => (b.publishedAt || 0) - (a.publishedAt || 0));
+            // Mezcla noticias de todos los feeds por fecha/hora, no por origen.
+            this.allItems.sort((a, b) => (b.publishedAt || 0) - (a.publishedAt || 0));
 
-        document.getElementById("loader").classList.add("hidden");
-        if (window.innerWidth < 768) this.toggleSidebar();
-        this.applyFilters();
+            if (closeSidebarOnMobile && window.innerWidth < 768) this.toggleSidebar();
+            this.applyFilters();
+        } finally {
+            document.getElementById("loader").classList.add("hidden");
+            this.isRefreshingFeeds = false;
+        }
     }
 
     applyFilters() {
@@ -1203,6 +1312,7 @@ class AppFeed {
     }
 
     editFeed(id) {
+        this.closeManageFeedsModal();
         this.openModal("feed", this.db.feeds.find((f) => f.id === id));
     }
 }
@@ -1215,6 +1325,8 @@ window.closeModal = () => app.closeModal();
 window.toggleDarkMode = () => app.toggleDarkMode();
 window.applyFilters = () => app.applyFilters();
 window.loadAllFeeds = (filterCatId = null) => app.loadAllFeeds(filterCatId);
+window.setRefreshInterval = (valueMs) => app.setRefreshInterval(valueMs);
+window.setAutoRefreshEnabled = (enabled) => app.setAutoRefreshEnabled(enabled);
 window.deleteCategory = (id) => app.deleteCategory(id);
 window.deleteFeed = (id) => app.deleteFeed(id);
 window.editFeed = (id) => app.editFeed(id);
