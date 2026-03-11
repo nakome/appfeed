@@ -27,6 +27,10 @@ class AppFeed {
         this.autoRefreshEnabled = true;
         this.autoRefreshTimer = null;
         this.isRefreshingFeeds = false;
+        this.reopenManageFeedsAfterModalClose = false;
+        this.feedDetectDebounceTimer = null;
+        this.feedDetectInProgress = false;
+        this.lastDetectedInputUrl = "";
 
         this.db = {
             categories: [],
@@ -339,6 +343,185 @@ class AppFeed {
         }
     }
 
+    normalizeUrl(value) {
+        const raw = String(value || "").trim();
+        if (!raw) return "";
+
+        const withProtocol = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+        try {
+            return new URL(withProtocol).toString();
+        } catch {
+            return "";
+        }
+    }
+
+    isLikelyFeedUrl(url) {
+        return /(?:rss|atom|feed|xml)(?:[/?#.]|$)/i.test(String(url || ""));
+    }
+
+    setFeedDetectStatus(text, isError = false) {
+        const el = document.getElementById("feed-detect-status");
+        if (!el) return;
+
+        el.textContent = text || "";
+        el.classList.toggle("text-red-500", Boolean(isError));
+        el.classList.toggle("text-slate-500", !isError);
+    }
+
+    renderFeedCandidates(urls) {
+        const select = document.getElementById("feed-candidate-select");
+        if (!select) return;
+
+        const candidates = Array.from(new Set((urls || []).filter(Boolean)));
+        if (!candidates.length) {
+            select.classList.add("hidden");
+            select.innerHTML = "";
+            return;
+        }
+
+        select.innerHTML = candidates.map((url) => `<option value="${url}">${url}</option>`).join("");
+        select.classList.remove("hidden");
+    }
+
+    handleFeedUrlInputChange() {
+        const input = document.getElementById("val1");
+        const current = String(input?.value || "").trim();
+
+        this.setFeedDetectStatus("");
+        this.renderFeedCandidates([]);
+
+        if (this.feedDetectDebounceTimer) {
+            clearTimeout(this.feedDetectDebounceTimer);
+            this.feedDetectDebounceTimer = null;
+        }
+
+        if (!current) {
+            this.lastDetectedInputUrl = "";
+            return;
+        }
+
+        this.feedDetectDebounceTimer = window.setTimeout(() => {
+            this.detectFeedSources({ auto: true });
+        }, 700);
+    }
+
+    async discoverFeedUrls(inputUrl) {
+        const normalized = this.normalizeUrl(inputUrl);
+        if (!normalized) return [];
+
+        const response = await fetch(`proxy.php?url=${encodeURIComponent(normalized)}`);
+        const raw = await response.text();
+        if (!response.ok) {
+            return [];
+        }
+
+        const parser = new DOMParser();
+        const asXml = parser.parseFromString(raw, "text/xml");
+        const xmlError = asXml.querySelector("parsererror");
+        const rootName = asXml?.documentElement?.nodeName?.toLowerCase() || "";
+
+        if (!xmlError && ["rss", "feed", "rdf:rdf"].includes(rootName)) {
+            return [normalized];
+        }
+
+        const asHtml = parser.parseFromString(raw, "text/html");
+        const links = [];
+        const addUrl = (href) => {
+            if (!href) return;
+            try {
+                links.push(new URL(href, normalized).toString());
+            } catch {
+                // noop
+            }
+        };
+
+        asHtml
+            .querySelectorAll('link[rel~="alternate"]')
+            .forEach((el) => {
+                const type = (el.getAttribute("type") || "").toLowerCase();
+                const href = el.getAttribute("href") || "";
+                if (type.includes("rss") || type.includes("atom") || type.includes("xml")) {
+                    addUrl(href);
+                }
+            });
+
+        asHtml.querySelectorAll("a[href]").forEach((el) => {
+            const href = el.getAttribute("href") || "";
+            if (/(?:rss|atom|feed|xml)/i.test(href)) {
+                addUrl(href);
+            }
+        });
+
+        ["/feed", "/rss", "/rss.xml", "/atom.xml", "/feed.xml", "/index.xml"].forEach((path) => {
+            addUrl(path);
+        });
+
+        const candidates = Array.from(new Set(links)).slice(0, 12);
+        if (!candidates.length) return [];
+
+        const checks = await Promise.all(
+            candidates.map(async (url) => ({ url, result: await this.fetchRSS(url) })),
+        );
+
+        return checks.filter((item) => !item.result.error).map((item) => item.url);
+    }
+
+    async detectFeedSources(options = {}) {
+        const { auto = false } = options;
+        const input = document.getElementById("val1");
+        const btn = document.getElementById("detect-feed-btn");
+        if (!input || !btn) return;
+
+        const url = String(input.value || "").trim();
+        if (!url) {
+            if (!auto) this.setFeedDetectStatus("Escribe una URL primero.", true);
+            return;
+        }
+
+        if (this.feedDetectInProgress) return;
+        if (auto && url === this.lastDetectedInputUrl) return;
+        if (auto && this.isLikelyFeedUrl(url)) return;
+
+        this.feedDetectInProgress = true;
+        this.lastDetectedInputUrl = url;
+
+        btn.disabled = true;
+        btn.textContent = "Buscando...";
+        if (!auto) {
+            this.setFeedDetectStatus("Buscando fuentes RSS/Atom...");
+            this.renderFeedCandidates([]);
+        }
+
+        try {
+            const found = await this.discoverFeedUrls(url);
+            if (!found.length) {
+                if (!auto) {
+                    this.setFeedDetectStatus("No encontré fuentes RSS/Atom en esa URL.", true);
+                }
+                return;
+            }
+
+            this.renderFeedCandidates(found);
+            this.setFeedDetectStatus(
+                found.length === 1
+                    ? "Encontré 1 fuente. Puedes guardar directamente."
+                    : `Encontré ${found.length} fuentes. Elige una.`,
+            );
+
+            if (found.length === 1) {
+                input.value = found[0];
+            }
+        } catch (error) {
+            if (!auto) {
+                this.setFeedDetectStatus(`Error al detectar fuentes: ${this.formatErrorMessage(error)}`, true);
+            }
+        } finally {
+            btn.disabled = false;
+            btn.textContent = "Buscar fuentes";
+            this.feedDetectInProgress = false;
+        }
+    }
+
     makeItemKey(link, title) {
         return `${link}::${title}`.toLowerCase();
     }
@@ -525,10 +708,20 @@ class AppFeed {
             type === "cat"
                 ? `<input id="val1" type="text" value="${existingData?.name || ""}" placeholder="Nombre" class="w-full p-2 bg-slate-100 dark:bg-slate-700 rounded-md">
                    <input id="val2" type="color" value="${existingData?.color || "#3b82f6"}" class="w-full h-10 rounded-md">`
-                : `<input id="val1" type="text" value="${existingData?.url || ""}" placeholder="URL RSS" class="w-full p-2 bg-slate-100 dark:bg-slate-700 rounded-md">
+                : `<input id="val1" type="text" value="${existingData?.url || ""}" placeholder="URL del sitio o RSS" oninput="handleFeedUrlInputChange()" class="w-full p-2 bg-slate-100 dark:bg-slate-700 rounded-md">
+                   <div class="flex items-center gap-2">
+                     <button id="detect-feed-btn" type="button" onclick="detectFeedSources()" class="px-3 py-2 bg-slate-200 dark:bg-slate-700 rounded-md text-xs font-medium">Buscar fuentes</button>
+                     <span id="feed-detect-status" class="text-xs text-slate-500"></span>
+                   </div>
+                   <select id="feed-candidate-select" class="hidden w-full p-2 bg-slate-100 dark:bg-slate-700 rounded-md text-xs" onchange="document.getElementById('val1').value=this.value"></select>
                    <select id="val2" class="w-full p-2 bg-slate-100 dark:bg-slate-700 rounded-md">${this.db.categories
                     .map((c) => `<option value="${c.id}" ${existingData?.catId === c.id ? "selected" : ""}>${c.name}</option>`)
                     .join("")}</select>`;
+
+        if (type === "feed") {
+            this.setFeedDetectStatus("");
+            this.renderFeedCandidates([]);
+        }
 
         document.getElementById("modal-save").onclick = async () => {
             if (type === "cat") {
@@ -538,9 +731,41 @@ class AppFeed {
                     color: document.getElementById("val2").value,
                 });
             } else {
+                let selectedUrl = String(document.getElementById("val1").value || "").trim();
+                const candidate = document.getElementById("feed-candidate-select")?.value;
+                if (candidate) selectedUrl = candidate;
+
+                if (!selectedUrl) {
+                    this.setFeedDetectStatus("Debes indicar una URL.", true);
+                    return;
+                }
+
+                selectedUrl = this.normalizeUrl(selectedUrl);
+                if (!selectedUrl) {
+                    this.setFeedDetectStatus("URL invalida.", true);
+                    return;
+                }
+
+                if (!this.isLikelyFeedUrl(selectedUrl)) {
+                    const found = await this.discoverFeedUrls(selectedUrl);
+                    if (!found.length) {
+                        this.setFeedDetectStatus("No encontré una fuente RSS/Atom para esa URL.", true);
+                        return;
+                    }
+
+                    if (found.length > 1) {
+                        this.renderFeedCandidates(found);
+                        this.setFeedDetectStatus("Encontré varias fuentes. Elige una y vuelve a guardar.");
+                        return;
+                    }
+
+                    selectedUrl = found[0];
+                    document.getElementById("val1").value = selectedUrl;
+                }
+
                 this.db.feeds.push({
                     id: "f" + Date.now(),
-                    url: document.getElementById("val1").value,
+                    url: selectedUrl,
                     catId: document.getElementById("val2").value,
                 });
             }
@@ -553,6 +778,11 @@ class AppFeed {
 
     closeModal() {
         document.getElementById("modal").classList.add("hidden");
+
+        if (this.reopenManageFeedsAfterModalClose) {
+            this.reopenManageFeedsAfterModalClose = false;
+            this.openManageFeedsModal();
+        }
     }
 
     // Abre/cierra modal de gestion de fuentes.
@@ -1312,6 +1542,7 @@ class AppFeed {
     }
 
     editFeed(id) {
+        this.reopenManageFeedsAfterModalClose = true;
         this.closeManageFeedsModal();
         this.openModal("feed", this.db.feeds.find((f) => f.id === id));
     }
@@ -1327,6 +1558,8 @@ window.applyFilters = () => app.applyFilters();
 window.loadAllFeeds = (filterCatId = null) => app.loadAllFeeds(filterCatId);
 window.setRefreshInterval = (valueMs) => app.setRefreshInterval(valueMs);
 window.setAutoRefreshEnabled = (enabled) => app.setAutoRefreshEnabled(enabled);
+window.detectFeedSources = () => app.detectFeedSources();
+window.handleFeedUrlInputChange = () => app.handleFeedUrlInputChange();
 window.deleteCategory = (id) => app.deleteCategory(id);
 window.deleteFeed = (id) => app.deleteFeed(id);
 window.editFeed = (id) => app.editFeed(id);
@@ -1349,4 +1582,15 @@ window.createJsonBackup = () => app.createJsonBackup();
 window.signInUser = () => app.signInUser();
 window.signOutUser = () => app.signOutUser();
 
+async function registerServiceWorker() {
+    if (!("serviceWorker" in navigator)) return;
+
+    try {
+        await navigator.serviceWorker.register("./sw.js");
+    } catch (error) {
+        console.warn("No se pudo registrar el Service Worker:", error);
+    }
+}
+
+registerServiceWorker();
 app.init();
