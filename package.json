@@ -1,0 +1,14 @@
+{
+  "name": "appfeed",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AppFeed quality tooling (lint + tests)",
+  "scripts": {
+    "lint": "eslint .",
+    "test": "node tests/feed-utils.test.js",
+    "check": "npm run lint && npm run test"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.1"
+  }
+}

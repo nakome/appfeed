@@ -23,3 +23,10 @@
 /app/Config/core.php
 /app/Config/database.php
 /vendors/*
+
+# Node.js
+/node_modules/
+
+# Environment
+/.env
+/.env.*

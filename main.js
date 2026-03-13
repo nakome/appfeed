@@ -4,6 +4,7 @@ class AppFeed {
         this.allItems = [];
         this.filteredItems = [];
         this.failedFeeds = [];
+        this.feedDiagnostics = [];
         this.itemMeta = {};
         this.pendingTags = new Set();
 
@@ -21,12 +22,15 @@ class AppFeed {
 
         this.currentPage = 1;
         this.itemsPerPage = 9;
+        this.responsiveLayoutReady = false;
+        this.viewportResizeTimer = null;
 
         this.currentFilterCatId = null;
         this.autoRefreshMs = 5 * 60 * 1000;
         this.autoRefreshEnabled = true;
         this.autoRefreshTimer = null;
         this.isRefreshingFeeds = false;
+        this.lastRefreshAt = 0;
         this.reopenManageFeedsAfterModalClose = false;
         this.feedDetectDebounceTimer = null;
         this.feedDetectInProgress = false;
@@ -39,11 +43,49 @@ class AppFeed {
                 darkMode: true,
                 autoRefreshMs: 5 * 60 * 1000,
                 autoRefreshEnabled: true,
+                layoutDensity: "auto",
             },
         };
 
         this.CONFIG_PATH = "rss_config.json";
         this.BACKUP_DIR = "~/AppFeedBackups";
+
+        this.utils = window.FeedUtils || {
+            normalizeUrl: (value) => {
+                const raw = String(value || "").trim();
+                if (!raw) return "";
+                const withProtocol = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+                try {
+                    return new URL(withProtocol).toString();
+                } catch {
+                    return "";
+                }
+            },
+            isLikelyFeedUrl: (url) => /(?:rss|atom|feed|xml)(?:[/?#.]|$)/i.test(String(url || "")),
+            parsePublishedTimestamp: (value) => {
+                if (!value) return 0;
+                const time = Date.parse(value);
+                return Number.isNaN(time) ? 0 : time;
+            },
+            sanitizePlainText: (value, fallback = "") => {
+                const source = String(value || "");
+                const cleaned = Array.from(source, (ch) => {
+                    const code = ch.charCodeAt(0);
+                    if (code < 32 || code === 127) return " ";
+                    return ch;
+                }).join("");
+                const text = cleaned.replace(/\s+/g, " ").trim();
+                return text || fallback;
+            },
+            safeExternalUrl: (value) => {
+                try {
+                    const parsed = new URL(String(value || ""), window.location.href);
+                    return /^https?:$/i.test(parsed.protocol) ? parsed.toString() : "";
+                } catch {
+                    return "";
+                }
+            },
+        };
     }
 
     // Inicializa config, tema, auth y carga inicial.
@@ -71,6 +113,7 @@ class AppFeed {
 
             this.applyThemePreference();
             this.renderUI();
+            this.setupResponsiveLayout();
             this.autoRefreshMs = this.db.settings.autoRefreshMs;
             this.autoRefreshEnabled = this.db.settings.autoRefreshEnabled;
             this.updateRefreshIntervalControl();
@@ -118,6 +161,40 @@ class AppFeed {
         await this.loadAllFeeds(this.currentFilterCatId, { preservePage: true, closeSidebarOnMobile: false });
     }
 
+    setRefreshStatus(text) {
+        const status = document.getElementById("refresh-status");
+        if (!status) return;
+        status.textContent = text;
+    }
+
+    updateRetryFailedButton() {
+        const btn = document.getElementById("retry-failed-btn");
+        if (!btn) return;
+        btn.classList.toggle("hidden", !this.failedFeeds.length);
+    }
+
+    showToast(message, type = "info") {
+        const container = document.getElementById("toast-container");
+        if (!container || !message) return;
+
+        const toneMap = {
+            info: "bg-slate-800 text-white",
+            success: "bg-emerald-700 text-white",
+            warn: "bg-amber-600 text-white",
+            error: "bg-red-600 text-white",
+        };
+
+        const toast = document.createElement("div");
+        toast.className = `rounded-md px-3 py-2 text-xs shadow-lg transition-opacity duration-300 ${toneMap[type] || toneMap.info}`;
+        toast.textContent = message;
+        container.appendChild(toast);
+
+        window.setTimeout(() => {
+            toast.style.opacity = "0";
+            window.setTimeout(() => toast.remove(), 280);
+        }, 2600);
+    }
+
     updateRefreshIntervalControl() {
         const select = document.getElementById("refreshIntervalSelect");
         if (!select) return;
@@ -135,6 +212,15 @@ class AppFeed {
 
         if (toggle) toggle.checked = this.autoRefreshEnabled;
         if (label) label.textContent = this.autoRefreshEnabled ? "Auto ON" : "Auto OFF";
+    }
+
+    updateLayoutDensityControl() {
+        const select = document.getElementById("densitySelect");
+        if (!select) return;
+
+        const value = String(this.db?.settings?.layoutDensity || "auto");
+        const hasOption = Array.from(select.options).some((opt) => opt.value === value);
+        select.value = hasOption ? value : "auto";
     }
 
     async setRefreshInterval(valueMs) {
@@ -164,6 +250,24 @@ class AppFeed {
         await this.saveToPuter();
     }
 
+    async setLayoutDensity(value) {
+        const allowed = new Set(["auto", "compact", "comfortable"]);
+        const next = allowed.has(value) ? value : "auto";
+        if (next === this.db.settings.layoutDensity) return;
+
+        this.db.settings.layoutDensity = next;
+        this.updateLayoutDensityControl();
+
+        const changed = this.updateItemsPerPageByViewport();
+        if (changed) {
+            const totalPages = Math.max(1, Math.ceil(this.filteredItems.length / this.itemsPerPage));
+            if (this.currentPage > totalPages) this.currentPage = totalPages;
+            this.renderPage(this.filteredItems);
+        }
+
+        await this.saveToPuter();
+    }
+
     // Guarda estado persistente.
     async saveToPuter() {
         await puter.fs.write(this.CONFIG_PATH, JSON.stringify(this.db));
@@ -186,6 +290,9 @@ class AppFeed {
         if (typeof this.db.settings.autoRefreshEnabled !== "boolean") {
             this.db.settings.autoRefreshEnabled = true;
         }
+        if (!["auto", "compact", "comfortable"].includes(this.db.settings.layoutDensity)) {
+            this.db.settings.layoutDensity = "auto";
+        }
     }
 
     // Activa o desactiva dark mode.
@@ -207,6 +314,8 @@ class AppFeed {
             icon.textContent = "🌙";
             label.textContent = "Modo Oscuro";
         }
+
+        this.renderMobileQuickActionsState();
     }
 
     toggleSidebar() {
@@ -222,7 +331,7 @@ class AppFeed {
                 <div class="group flex items-center justify-between p-2 rounded-md hover:bg-slate-200 dark:hover:bg-slate-700 cursor-pointer" onclick="loadAllFeeds('${cat.id}')">
                     <div class="flex items-center gap-2">
                         <span class="w-3 h-3 rounded-md" style="background:${cat.color}"></span>
-                        <span class="text-sm font-medium">${cat.name}</span>
+                        <span class="text-sm font-medium">${this.escapeHtml(cat.name)}</span>
                     </div>
                     <button onclick="event.stopPropagation(); deleteCategory('${cat.id}')" class="opacity-0 group-hover:opacity-100 text-red-500 text-xs">✕</button>
                 </div>
@@ -234,7 +343,7 @@ class AppFeed {
             .map(
                 (feed) => `
                 <div class="text-[11px] border-b border-slate-100 dark:border-slate-800 py-2 flex justify-between items-center group">
-                    <div class="truncate flex-1 pr-2 font-bold">${feed.url}</div>
+                    <div class="truncate flex-1 pr-2 font-bold">${this.escapeHtml(feed.url)}</div>
                     <div class="flex gap-1">
                         <button onclick="editFeed('${feed.id}')" class="p-1 text-blue-500">✏️</button>
                         <button onclick="deleteFeed('${feed.id}')" class="p-1 text-red-500">✕</button>
@@ -245,6 +354,93 @@ class AppFeed {
             .join("");
 
         this.renderAuthPanel();
+        this.updateLayoutDensityControl();
+        this.renderMobileQuickActionsState();
+    }
+
+    setupResponsiveLayout() {
+        if (this.responsiveLayoutReady) return;
+        this.responsiveLayoutReady = true;
+
+        this.updateItemsPerPageByViewport();
+
+        window.addEventListener("resize", () => {
+            if (this.viewportResizeTimer) {
+                window.clearTimeout(this.viewportResizeTimer);
+            }
+
+            this.viewportResizeTimer = window.setTimeout(() => {
+                const changed = this.updateItemsPerPageByViewport();
+                if (!changed) return;
+
+                const totalPages = Math.max(1, Math.ceil(this.filteredItems.length / this.itemsPerPage));
+                if (this.currentPage > totalPages) this.currentPage = totalPages;
+
+                this.renderPage(this.filteredItems);
+                this.renderMobileQuickActionsState();
+            }, 140);
+        });
+
+        const searchInput = document.getElementById("searchInput");
+        if (searchInput) {
+            searchInput.addEventListener("focus", () => this.renderMobileQuickActionsState());
+            searchInput.addEventListener("blur", () => this.renderMobileQuickActionsState());
+        }
+
+        this.renderMobileQuickActionsState();
+    }
+
+    updateItemsPerPageByViewport() {
+        const width = window.innerWidth || 1280;
+        const density = this.db?.settings?.layoutDensity || "auto";
+        let next = 12;
+
+        if (width < 640) {
+            next = density === "compact" ? 8 : density === "comfortable" ? 4 : 6;
+        } else if (width < 1024) {
+            next = density === "compact" ? 10 : density === "comfortable" ? 6 : 8;
+        } else {
+            next = density === "compact" ? 14 : density === "comfortable" ? 9 : 12;
+        }
+
+        if (this.itemsPerPage === next) return false;
+
+        this.itemsPerPage = next;
+        return true;
+    }
+
+    setQuickActionActive(action, isActive) {
+        const btn = document.querySelector(`[data-quick-action="${action}"]`);
+        if (!btn) return;
+
+        btn.classList.toggle("bg-slate-200", isActive);
+        btn.classList.toggle("dark:bg-slate-700", isActive);
+        btn.classList.toggle("text-slate-900", isActive);
+        btn.classList.toggle("dark:text-white", isActive);
+    }
+
+    renderMobileQuickActionsState() {
+        const isMobile = window.innerWidth < 768;
+        const isChatOpen = !document.getElementById("ai-chat-modal")?.classList.contains("hidden");
+        const isFeedsOpen = !document.getElementById("manage-feeds-modal")?.classList.contains("hidden");
+        const isGeneralModalOpen = !document.getElementById("modal")?.classList.contains("hidden");
+        const hasSearchFocus = document.activeElement?.id === "searchInput";
+        const isDark = Boolean(this.db?.settings?.darkMode);
+
+        this.setQuickActionActive("home", isMobile && !isChatOpen && !isFeedsOpen && !isGeneralModalOpen && !hasSearchFocus);
+        this.setQuickActionActive("search", isMobile && hasSearchFocus);
+        this.setQuickActionActive("chat", isMobile && isChatOpen);
+        this.setQuickActionActive("feeds", isMobile && (isFeedsOpen || isGeneralModalOpen));
+        this.setQuickActionActive("theme", isMobile && isDark);
+    }
+
+    focusSearchInput() {
+        const input = document.getElementById("searchInput");
+        if (!input) return;
+
+        input.focus();
+        input.scrollIntoView({ behavior: "smooth", block: "center" });
+        this.renderMobileQuickActionsState();
     }
 
     // Pinta info de usuario autenticado.
@@ -291,7 +487,17 @@ class AppFeed {
     // Descarga y normaliza items RSS/Atom.
     async fetchRSS(url) {
         try {
-            const response = await fetch(`proxy.php?url=${encodeURIComponent(url)}`);
+            const controller = new AbortController();
+            const timeoutId = window.setTimeout(() => controller.abort(), 12000);
+            const response = await fetch(`proxy.php?url=${encodeURIComponent(url)}`, {
+                signal: controller.signal,
+            });
+            window.clearTimeout(timeoutId);
+
+            if (!response.ok) {
+                return { items: [], error: `HTTP ${response.status}` };
+            }
+
             const text = await response.text();
             const parser = new DOMParser();
             const xml = parser.parseFromString(text, "text/xml");
@@ -326,11 +532,20 @@ class AppFeed {
                         i.querySelector("link")?.textContent ||
                         "#";
 
+                    const safeTitle = this.utils.sanitizePlainText(
+                        i.querySelector("title")?.textContent || "",
+                        "Sin titulo",
+                    );
+                    const safeDescription = this.utils.sanitizePlainText(
+                        desc.replace(/<[^>]*>?/gm, "").substring(0, 180),
+                        "Sin descripcion",
+                    );
+
                     return {
-                        key: this.makeItemKey(link, i.querySelector("title")?.textContent || "Sin titulo"),
-                        title: i.querySelector("title")?.textContent || "Sin titulo",
+                        key: this.makeItemKey(link, safeTitle),
+                        title: safeTitle,
                         link,
-                        description: desc.replace(/<[^>]*>?/gm, "").substring(0, 180) + "...",
+                        description: `${safeDescription}...`,
                         image: img || false,
                         ocrText: "",
                         publishedAt,
@@ -339,24 +554,23 @@ class AppFeed {
                 error: null,
             };
         } catch (e) {
+            if (e?.name === "AbortError") {
+                return { items: [], error: "Tiempo de espera agotado" };
+            }
             return { items: [], error: e.message };
         }
     }
 
     normalizeUrl(value) {
-        const raw = String(value || "").trim();
-        if (!raw) return "";
-
-        const withProtocol = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
-        try {
-            return new URL(withProtocol).toString();
-        } catch {
-            return "";
-        }
+        return this.utils.normalizeUrl(value);
     }
 
     isLikelyFeedUrl(url) {
-        return /(?:rss|atom|feed|xml)(?:[/?#.]|$)/i.test(String(url || ""));
+        return this.utils.isLikelyFeedUrl(url);
+    }
+
+    safeExternalUrl(value) {
+        return this.utils.safeExternalUrl(value);
     }
 
     setFeedDetectStatus(text, isError = false) {
@@ -379,7 +593,12 @@ class AppFeed {
             return;
         }
 
-        select.innerHTML = candidates.map((url) => `<option value="${url}">${url}</option>`).join("");
+        select.innerHTML = candidates
+            .map((url) => {
+                const safe = this.escapeHtml(url);
+                return `<option value="${safe}">${safe}</option>`;
+            })
+            .join("");
         select.classList.remove("hidden");
     }
 
@@ -527,9 +746,7 @@ class AppFeed {
     }
 
     parsePublishedTimestamp(value) {
-        if (!value) return 0;
-        const time = Date.parse(value);
-        return Number.isNaN(time) ? 0 : time;
+        return this.utils.parsePublishedTimestamp(value);
     }
 
     async loadAllFeeds(filterCatId = null, options = {}) {
@@ -545,22 +762,56 @@ class AppFeed {
         const container = document.getElementById("feed-container");
         document.getElementById("loader").classList.remove("hidden");
         container.innerHTML = "";
+        this.setRefreshStatus("Actualizando...");
 
         const feeds = filterCatId
             ? this.db.feeds.filter((f) => f.catId === filterCatId)
             : this.db.feeds;
+        this.feedDiagnostics = [];
+
+        if (!feeds.length) {
+            this.filteredItems = [];
+            this.renderPage([]);
+            this.updateRetryFailedButton();
+            this.setRefreshStatus("Sin feeds configurados");
+            this.renderMobileQuickActionsState();
+            document.getElementById("loader").classList.add("hidden");
+            this.isRefreshingFeeds = false;
+            return;
+        }
 
         try {
             const feedResults = await Promise.all(
-                feeds.map(async (feed) => ({ feed, res: await this.fetchRSS(feed.url) })),
+                feeds.map(async (feed) => {
+                    const startedAt = performance.now();
+                    const res = await this.fetchRSS(feed.url);
+                    const durationMs = Math.round(performance.now() - startedAt);
+                    return { feed, res, durationMs };
+                }),
             );
 
-            feedResults.forEach(({ feed, res }) => {
+            feedResults.forEach(({ feed, res, durationMs }) => {
                 if (res.error) {
                     this.failedFeeds.push({ url: feed.url, error: res.error });
+                    this.feedDiagnostics.push({
+                        url: feed.url,
+                        status: "error",
+                        error: res.error,
+                        itemCount: 0,
+                        durationMs,
+                        checkedAt: new Date().toISOString(),
+                    });
                     return;
                 }
                 this.allItems.push(...res.items);
+                this.feedDiagnostics.push({
+                    url: feed.url,
+                    status: "ok",
+                    error: "",
+                    itemCount: res.items.length,
+                    durationMs,
+                    checkedAt: new Date().toISOString(),
+                });
             });
 
             // Mezcla noticias de todos los feeds por fecha/hora, no por origen.
@@ -568,6 +819,23 @@ class AppFeed {
 
             if (closeSidebarOnMobile && window.innerWidth < 768) this.toggleSidebar();
             this.applyFilters();
+
+            this.lastRefreshAt = Date.now();
+            const loadedFeeds = feeds.length - this.failedFeeds.length;
+            const timeLabel = new Date(this.lastRefreshAt).toLocaleTimeString("es-ES", {
+                hour: "2-digit",
+                minute: "2-digit",
+            });
+            this.setRefreshStatus(
+                `${loadedFeeds}/${feeds.length} feeds · ${this.allItems.length} noticias · ${timeLabel}`,
+            );
+
+            if (this.failedFeeds.length) {
+                this.showToast(`Se detectaron ${this.failedFeeds.length} feeds con error`, "warn");
+            }
+            this.updateRetryFailedButton();
+            this.renderDiagnosticsIfOpen();
+            this.renderMobileQuickActionsState();
         } finally {
             document.getElementById("loader").classList.add("hidden");
             this.isRefreshingFeeds = false;
@@ -609,9 +877,30 @@ class AppFeed {
         const start = (this.currentPage - 1) * this.itemsPerPage;
         const pageItems = items.slice(start, start + this.itemsPerPage);
 
+        if (!pageItems.length) {
+            const hasSearch = Boolean(document.getElementById("searchInput")?.value?.trim());
+            const message = hasSearch
+                ? "No hay resultados para la busqueda actual."
+                : "No hay noticias disponibles todavia. Agrega feeds para comenzar.";
+
+            container.innerHTML += `
+              <div class="md:col-span-2 lg:col-span-3 rounded-md border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 p-6 text-center">
+                  <h4 class="font-bold text-sm mb-2">Vista vacia</h4>
+                  <p class="text-xs text-slate-500 dark:text-slate-300">${message}</p>
+              </div>
+            `;
+            this.renderPagination(items.length);
+            return;
+        }
+
         pageItems.forEach((item, idx) => {
-            const imageFeed = item.image
-                ? `<img src="${item.image}" class="w-full h-full object-cover">`
+            const safeTitle = this.escapeHtml(item.title || "Sin titulo");
+            const safeDescription = this.escapeHtml(item.description || "");
+            const safeLink = this.safeExternalUrl(item.link) || "#";
+            const safeImage = this.safeExternalUrl(item.image);
+
+            const imageFeed = safeImage
+                ? `<img src="${safeImage}" loading="lazy" alt="Imagen de la noticia" class="w-full h-full object-cover">`
                 : `<div class="w-full h-40 bg-slate-300 dark:bg-slate-600 flex items-center justify-center text-sm text-slate-500">Sin imagen</div>`;
 
             const encodedTitle = encodeURIComponent(item.title);
@@ -636,19 +925,19 @@ class AppFeed {
                   <div class="p-5 flex flex-col flex-1">
                       <div class="flex items-center justify-between gap-2 mb-2">
                           <h4 class="font-bold text-slate-800 dark:text-slate-100 text-base">
-                              ${item.title}
+                              ${safeTitle}
                           </h4>
                           <span class="text-[10px] px-2 py-1 rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-200 whitespace-nowrap">
-                              ${tagText}
+                              ${this.escapeHtml(tagText)}
                           </span>
                       </div>
 
                       <p class="text-sm text-slate-500 dark:text-slate-400 mb-4 flex-1">
-                          ${item.description}
+                          ${safeDescription}
                       </p>
 
                                             <div class="mt-auto pt-3 flex items-center justify-between gap-3">
-                                                <a href="${item.link}" target="_blank" class="text-blue-600 font-bold text-xs uppercase">
+                                                <a href="${safeLink}" target="_blank" rel="noopener noreferrer" class="text-blue-600 font-bold text-xs uppercase">
                                                     Ir a la noticia ➔
                                                 </a>
 
@@ -669,16 +958,96 @@ class AppFeed {
         if (!this.failedFeeds.length) return;
 
         const warnings = this.failedFeeds
-            .map((f) => `<li class="truncate">${f.url} (${f.error})</li>`)
+            .map(
+                (f) =>
+                    `<li class="truncate">${this.escapeHtml(f.url)} (${this.escapeHtml(f.error)})</li>`,
+            )
             .join("");
 
         container.innerHTML += `
           <div class="md:col-span-2 lg:col-span-3 rounded-md border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 p-4 text-amber-900 dark:text-amber-100">
               <h4 class="font-bold text-sm mb-2">Algunas fuentes no se pudieron cargar</h4>
               <ul class="text-xs space-y-1">${warnings}</ul>
+              <div class="mt-3">
+                <button onclick="retryFailedFeeds()" class="text-xs font-bold underline">Reintentar ahora</button>
+              </div>
           </div>
         `;
     }
+
+    async retryFailedFeeds() {
+        if (!this.failedFeeds.length) {
+            this.showToast("No hay feeds fallidos para reintentar", "info");
+            return;
+        }
+
+        this.showToast("Reintentando feeds fallidos...", "info");
+        await this.loadAllFeeds(this.currentFilterCatId, { preservePage: true, closeSidebarOnMobile: false });
+    }
+
+        renderDiagnosticsIfOpen() {
+                const modal = document.getElementById("diagnostics-modal");
+                if (modal?.classList.contains("hidden")) return;
+                this.renderDiagnosticsModal();
+        }
+
+        openDiagnosticsModal() {
+                document.getElementById("diagnostics-modal")?.classList.remove("hidden");
+                this.renderDiagnosticsModal();
+        }
+
+        closeDiagnosticsModal() {
+                document.getElementById("diagnostics-modal")?.classList.add("hidden");
+        }
+
+        renderDiagnosticsModal() {
+                const container = document.getElementById("diagnostics-content");
+                if (!container) return;
+
+                if (!this.feedDiagnostics.length) {
+                        container.innerHTML =
+                                '<p class="text-slate-500 dark:text-slate-300">No hay datos de diagnostico todavia. Ejecuta una carga de feeds.</p>';
+                        return;
+                }
+
+                const rows = this.feedDiagnostics
+                        .map((d) => {
+                                const tone = d.status === "ok" ? "text-emerald-700 dark:text-emerald-300" : "text-red-600 dark:text-red-300";
+                                const checkedAt = new Date(d.checkedAt).toLocaleTimeString("es-ES", {
+                                        hour: "2-digit",
+                                        minute: "2-digit",
+                                        second: "2-digit",
+                                });
+
+                                return `
+                                    <tr class="border-b border-slate-200 dark:border-slate-700 align-top">
+                                        <td class="py-2 pr-2 break-all">${this.escapeHtml(d.url)}</td>
+                                        <td class="py-2 pr-2 ${tone}">${this.escapeHtml(d.status)}</td>
+                                        <td class="py-2 pr-2">${d.itemCount}</td>
+                                        <td class="py-2 pr-2">${d.durationMs} ms</td>
+                                        <td class="py-2 pr-2">${this.escapeHtml(d.error || "-")}</td>
+                                        <td class="py-2 pr-2 whitespace-nowrap">${checkedAt}</td>
+                                    </tr>
+                                `;
+                        })
+                        .join("");
+
+                container.innerHTML = `
+                    <table class="w-full text-left text-xs">
+                        <thead>
+                            <tr class="border-b border-slate-300 dark:border-slate-600">
+                                <th class="py-2 pr-2">Feed</th>
+                                <th class="py-2 pr-2">Estado</th>
+                                <th class="py-2 pr-2">Items</th>
+                                <th class="py-2 pr-2">Tiempo</th>
+                                <th class="py-2 pr-2">Error</th>
+                                <th class="py-2 pr-2">Hora</th>
+                            </tr>
+                        </thead>
+                        <tbody>${rows}</tbody>
+                    </table>
+                `;
+        }
 
     renderPagination(total) {
         const pages = Math.ceil(total / this.itemsPerPage);
@@ -703,6 +1072,7 @@ class AppFeed {
     openModal(type, existingData = null) {
         const modal = document.getElementById("modal");
         modal.classList.remove("hidden");
+        this.renderMobileQuickActionsState();
 
         document.getElementById("modal-content").innerHTML =
             type === "cat"
@@ -778,6 +1148,7 @@ class AppFeed {
 
     closeModal() {
         document.getElementById("modal").classList.add("hidden");
+        this.renderMobileQuickActionsState();
 
         if (this.reopenManageFeedsAfterModalClose) {
             this.reopenManageFeedsAfterModalClose = false;
@@ -788,10 +1159,12 @@ class AppFeed {
     // Abre/cierra modal de gestion de fuentes.
     openManageFeedsModal() {
         document.getElementById("manage-feeds-modal")?.classList.remove("hidden");
+        this.renderMobileQuickActionsState();
     }
 
     closeManageFeedsModal() {
         document.getElementById("manage-feeds-modal")?.classList.add("hidden");
+        this.renderMobileQuickActionsState();
     }
 
     // Lanza selector de archivo JSON para importar configuracion.
@@ -879,10 +1252,12 @@ class AppFeed {
 
         this.renderAiChatMessages();
         document.getElementById("ai-chat-input")?.focus();
+        this.renderMobileQuickActionsState();
     }
 
     closeAiChatModal() {
         document.getElementById("ai-chat-modal")?.classList.add("hidden");
+        this.renderMobileQuickActionsState();
     }
 
     clearAiChat() {
@@ -925,7 +1300,9 @@ class AppFeed {
         return String(str)
             .replaceAll("&", "&amp;")
             .replaceAll("<", "&lt;")
-            .replaceAll(">", "&gt;");
+            .replaceAll(">", "&gt;")
+            .replaceAll('"', "&quot;")
+            .replaceAll("'", "&#39;");
     }
 
     setAiChatLoading(isLoading) {
@@ -1558,6 +1935,7 @@ window.applyFilters = () => app.applyFilters();
 window.loadAllFeeds = (filterCatId = null) => app.loadAllFeeds(filterCatId);
 window.setRefreshInterval = (valueMs) => app.setRefreshInterval(valueMs);
 window.setAutoRefreshEnabled = (enabled) => app.setAutoRefreshEnabled(enabled);
+window.setLayoutDensity = (value) => app.setLayoutDensity(value);
 window.detectFeedSources = () => app.detectFeedSources();
 window.handleFeedUrlInputChange = () => app.handleFeedUrlInputChange();
 window.deleteCategory = (id) => app.deleteCategory(id);
@@ -1578,6 +1956,10 @@ window.closeManageFeedsModal = () => app.closeManageFeedsModal();
 window.triggerConfigImport = () => app.triggerConfigImport();
 window.handleConfigImport = (event) => app.handleConfigImport(event);
 window.createJsonBackup = () => app.createJsonBackup();
+window.retryFailedFeeds = () => app.retryFailedFeeds();
+window.openDiagnosticsModal = () => app.openDiagnosticsModal();
+window.closeDiagnosticsModal = () => app.closeDiagnosticsModal();
+window.focusSearchInput = () => app.focusSearchInput();
 
 window.signInUser = () => app.signInUser();
 window.signOutUser = () => app.signOutUser();
